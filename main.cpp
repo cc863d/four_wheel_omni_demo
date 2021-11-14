@@ -1,5 +1,6 @@
 #include "mbed.h"
 #include <array>
+#include <cmath>
 
 #include "Encoder.h"
 #include "ps3_pin_interrupt.hpp"
@@ -18,16 +19,12 @@ DigitalOut dir[] = {
 };
 
 PS3 ps3(PA_0, PA_1);
-//  constants using manual controll
-float kx = 1.0f / 100.0f;
-float ky = 1.0f / 100.0f;
-float ktheta = 1.0f / 100.0f;
 
 Ticker ticker;
 const int tread_width = 440;
 const int half_of_thread_width = tread_width / 2;
 const double inverse_of_tread_width = 1.0f / tread_width;
-std::array<double, 3> current_configuration = {0, 0,
+std::array<float, 3> current_configuration = {0, 0,
                                                0}; // x[mm], y[mm], theta[rad]
 
 void UpdateEncoders(void) {
@@ -67,7 +64,7 @@ void GetCurrentConfiguration(void) {
     previous_distances[i] = encoders[i].Distance();
   }
 }
-void MoveFourWheelOmniByManual(float x, float y, float theta) {
+void MoveFourWheelOmni(float x, float y, float theta, float kx, float ky, float ktheta) {
   float v[4] = {0, 0, 0, 0};
   // See Inverse Kinematics of 4 wheel omni.
   v[0] = -kx * x + -ky * y + ktheta * theta;
@@ -85,13 +82,43 @@ void MoveFourWheelOmniByManual(float x, float y, float theta) {
   }
 }
 
+float RestrictMinusPitoPi(float x) {
+    float res = fmod((x + M_PI), 2 * M_PI) - M_PI;
+    return res;
+}
+
 int main(void) {
   ticker.attach_us(&UpdateEncoders, interrupt_period_us);
-  while (true) {
+
+  // x[mm], y[mm], theta[rad]
+  std::array<float, 3> desired_configuration = {400, 1200, 1.57};
+  // Supply Voltage: 7.89 V params
+  float kp_rho = 0.00038;
+  float kp_alpha = 0.04;
+  float kp_beta = -0.013;
+  float rho = numeric_limits<float>::max();
+  float alpha, beta;
+  float x_error, y_error;
+  float v, omega;
+  while (rho > 30) {
     GetCurrentConfiguration();
-    MoveFourWheelOmniByManual((float)(ps3.getAnalogHat(Rx) - 64),
-                              (float)(64 - ps3.getAnalogHat(Ry)),
-                              (float)(ps3.getAnalogHat(Lx) - 64));
+    x_error = desired_configuration[0] - current_configuration[0];
+    y_error = desired_configuration[1] - current_configuration[1];
+    rho = hypot(x_error, y_error);
+    alpha = atan2(y_error, x_error) - current_configuration[2];
+    beta = desired_configuration[2] - (current_configuration[2] + alpha);
+    alpha = RestrictMinusPitoPi(alpha);
+    beta = RestrictMinusPitoPi(beta);
+    v = kp_rho * rho;
+    omega = kp_alpha * alpha + kp_beta * beta;
+    if ((alpha < - M_PI / 2) || (M_PI / 2 < alpha)) {
+        v = -v;
+    }
+
+
+    MoveFourWheelOmni(v * cos(current_configuration[2]), v * sin(current_configuration[2]), -omega, 1, 1, 1);
+
+    printf("%f\t%f\t%f\t", v * cos(current_configuration[2]), v * sin(current_configuration[2]), (omega/2/M_PI)*360);
     for (int i = 0; i < 3; i++) {
       printf("%f\t", current_configuration[i]);
     }
