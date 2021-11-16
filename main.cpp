@@ -1,6 +1,7 @@
 #include "mbed.h"
 #include <array>
 #include <cmath>
+#include <limits>
 
 #include "Encoder.h"
 #include "ps3_pin_interrupt.hpp"
@@ -25,7 +26,7 @@ const int tread_width = 440;
 const int half_of_thread_width = tread_width / 2;
 const double inverse_of_tread_width = 1.0f / tread_width;
 std::array<float, 3> current_configuration = {0, 0,
-                                               0}; // x[mm], y[mm], theta[rad]
+                                              0}; // x[mm], y[mm], theta[rad]
 
 void UpdateEncoders(void) {
   for (int i = 0; i < 4; i++) {
@@ -64,7 +65,8 @@ void GetCurrentConfiguration(void) {
     previous_distances[i] = encoders[i].Distance();
   }
 }
-void MoveFourWheelOmni(float x, float y, float theta, float kx, float ky, float ktheta) {
+void MoveFourWheelOmni(float x, float y, float theta, float kx, float ky,
+                       float ktheta) {
   float v[4] = {0, 0, 0, 0};
   // See Inverse Kinematics of 4 wheel omni.
   v[0] = -kx * x + -ky * y + ktheta * theta;
@@ -83,42 +85,97 @@ void MoveFourWheelOmni(float x, float y, float theta, float kx, float ky, float 
 }
 
 float RestrictMinusPitoPi(float x) {
-    float res = fmod((x + M_PI), 2 * M_PI) - M_PI;
-    return res;
+  float res = fmod((x + M_PI), 2 * M_PI) - M_PI;
+  return res;
+}
+
+std::vector<std::array<int, 2>>
+LinearPlan(std::array<int, 2> const start_point,
+           std::array<int, 2> const goal_point) {
+  std::vector<std::array<int, 2>> res;
+  const int point_num = 100; // 100という点数は適当
+  std::array<double, 2> point = {double(start_point.at(0)),
+                                 double(start_point.at(1))};
+  double x_increment =
+      (goal_point.at(0) - start_point.at(0)) / (double)point_num;
+  double y_increment =
+      (goal_point.at(1) - start_point.at(1)) / (double)point_num;
+  for (int i = 0; i < point_num; i++) {
+    res.push_back({(int)point.at(0), (int)point.at(1)});
+    point.at(0) += x_increment;
+    point.at(1) += y_increment;
+  }
+  return res;
+}
+
+int SearchTargetIndex(const std::vector<std::array<int, 2>> &points, int x,
+                      int y, double v, int &old_nearest_point_index_) {
+  // Why can the index decrease?
+  int tmp_index = old_nearest_point_index_;
+  double distance_this_index =
+      hypot(x - points.at(tmp_index).at(0), y - points.at(tmp_index).at(1));
+  for (int i = tmp_index + 1; i < (int)points.size(); i++) {
+    int dx = x - points.at(i).at(0);
+    int dy = y - points.at(i).at(1);
+    double distance = hypot(dx, dy);
+    if (distance_this_index < distance) {
+      break;
+    }
+    tmp_index = ((i + 1) < (int)points.size()) ? (i + 1) : i;
+    distance_this_index = distance;
+  }
+  old_nearest_point_index_ = tmp_index;
+  double look_forward_distance = 80 + v * 0.001 * 300;
+  while (look_forward_distance > hypot(x - points.at(tmp_index).at(0),
+                                       y - points.at(tmp_index).at(1))) {
+    if ((tmp_index + 1) >= (int)points.size()) {
+      break;
+    }
+    tmp_index += 1;
+  }
+  return max(old_nearest_point_index_, tmp_index);
 }
 
 int main(void) {
   ticker.attach_us(&UpdateEncoders, interrupt_period_us);
-
   // x[mm], y[mm], theta[rad]
-  std::array<float, 3> desired_configuration = {400, 1200, 1.57};
-  // Supply Voltage: 7.89 V params
-  float kp_rho = 0.00038;
-  float kp_alpha = 0.04;
-  float kp_beta = -0.013;
-  float rho = numeric_limits<float>::max();
-  float alpha, beta;
-  float x_error, y_error;
-  float v, omega;
-  while (rho > 30) {
+  float v, vx, vy, vtheta;
+  float desired_direction;
+  float Kv = 0.002;
+  float error = numeric_limits<float>::max();
+  std::array<float, 3> desired_configuration = {0, 0,
+                                                0}; // x[mm], y[mm], theta[rad]
+  std::vector<std::array<int, 2>> desired_trajectory =
+      LinearPlan({{0, 0}}, {{300, 0}});
+  auto b = LinearPlan({{300, 0}}, {{300, 300}});
+  auto c = LinearPlan({{300, 300}}, {{0, 300}});
+  auto d = LinearPlan({{0, 300}}, {{0, 600}});
+  auto e = LinearPlan({{0, 600}}, {{300, 600}});
+  desired_trajectory.insert(desired_trajectory.end(), b.begin(), b.end());
+  desired_trajectory.insert(desired_trajectory.end(), c.begin(), c.end());
+  desired_trajectory.insert(desired_trajectory.end(), d.begin(), d.end());
+  desired_trajectory.insert(desired_trajectory.end(), e.begin(), e.end());
+  int index_nearest_point = 0, index_target_point = 0;
+  while (true) {
     GetCurrentConfiguration();
-    x_error = desired_configuration[0] - current_configuration[0];
-    y_error = desired_configuration[1] - current_configuration[1];
-    rho = hypot(x_error, y_error);
-    alpha = atan2(y_error, x_error) - current_configuration[2];
-    beta = desired_configuration[2] - (current_configuration[2] + alpha);
-    alpha = RestrictMinusPitoPi(alpha);
-    beta = RestrictMinusPitoPi(beta);
-    v = kp_rho * rho;
-    omega = kp_alpha * alpha + kp_beta * beta;
-    if ((alpha < - M_PI / 2) || (M_PI / 2 < alpha)) {
-        v = -v;
-    }
+    index_target_point =
+        SearchTargetIndex(desired_trajectory, current_configuration[0],
+                          current_configuration[1], v, index_nearest_point);
+    desired_configuration[0] = desired_trajectory[index_target_point][0];
+    desired_configuration[1] = desired_trajectory[index_target_point][1];
+    error = hypot(desired_configuration[0] - current_configuration[0],
+                  desired_configuration[1] - current_configuration[1]);
+    v = Kv * error;
+    desired_direction =
+        atan2(desired_configuration[1] - current_configuration[1],
+              desired_configuration[0] - current_configuration[0]);
+    vx = v * cos(desired_direction);
+    vy = v * sin(desired_direction);
+    vtheta = 0;
+    MoveFourWheelOmni(vx, vy, vtheta, 1, 1, 1);
 
-
-    MoveFourWheelOmni(v * cos(current_configuration[2]), v * sin(current_configuration[2]), -omega, 1, 1, 1);
-
-    printf("%f\t%f\t%f\t", v * cos(current_configuration[2]), v * sin(current_configuration[2]), (omega/2/M_PI)*360);
+    printf("%d\t%4.0f\t%4.0f\t%f\t%f\t%f\t", index_target_point,
+           desired_configuration[0], desired_configuration[1], vx, vy, vtheta);
     for (int i = 0; i < 3; i++) {
       printf("%f\t", current_configuration[i]);
     }
